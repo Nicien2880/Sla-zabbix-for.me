@@ -1,0 +1,74 @@
+#!/bin/bash
+
+ZABBIX_URL="http://zabbix/api_jsonrpc.php"
+API_TOKEN="ВАШ_API_TOKEN"
+TRIGGER_ID="12345"
+
+CHANNEL_NAME="ISP-1"
+
+MAIL_TO="admin@example.com"
+MAIL_SUBJECT="SLA отчёт: $CHANNEL_NAME"
+
+# прошлый месяц
+START=$(date -d "$(date +%Y-%m-01) -1 month" +%s)
+END=$(date -d "$(date +%Y-%m-01) -1 second" +%s)
+
+PERIOD_TEXT=$(LC_TIME=ru_RU.UTF-8 date -d "@$START" +"%B %Y")
+
+TOTAL_PERIOD=$((END - START + 1))
+
+DATA=$(curl -s -X POST "$ZABBIX_URL" \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer $API_TOKEN" \
+-d "{
+  \"jsonrpc\":\"2.0\",
+  \"method\":\"event.get\",
+  \"params\":{
+    \"output\":\"extend\",
+    \"objectids\":\"$TRIGGER_ID\",
+    \"time_from\":$START,
+    \"time_till\":$END,
+    \"select_recovery_event\":\"extend\",
+    \"sortfield\":\"clock\",
+    \"sortorder\":\"ASC\"
+  },
+  \"id\":1
+}")
+
+DOWNTIME=0
+INCIDENTS=0
+
+while read -r row; do
+    EVENT_START=$(echo "$row" | jq -r '.clock')
+    EVENT_END=$(echo "$row" | jq -r '.recovery_event.clock // empty')
+
+    if [ -z "$EVENT_END" ] || [ "$EVENT_END" = "null" ]; then
+        EVENT_END=$END
+    fi
+
+    # обрезаем границами месяца
+    if [ "$EVENT_START" -lt "$START" ]; then
+        EVENT_START=$START
+    fi
+
+    if [ "$EVENT_END" -gt "$END" ]; then
+        EVENT_END=$END
+    fi
+
+    DURATION=$((EVENT_END - EVENT_START))
+
+    if [ "$DURATION" -gt 0 ]; then
+        DOWNTIME=$((DOWNTIME + DURATION))
+        INCIDENTS=$((INCIDENTS + 1))
+    fi
+done < <(echo "$DATA" | jq -c '.result[]')
+
+UPTIME=$(awk "BEGIN {printf \"%.2f\", (($TOTAL_PERIOD - $DOWNTIME) / $TOTAL_PERIOD) * 100}")
+
+BODY="Канал: $CHANNEL_NAME
+Период: $PERIOD_TEXT
+Downtime: $DOWNTIME сек
+Uptime: $UPTIME%
+Инцидентов: $INCIDENTS"
+
+echo "$BODY" | mail -s "$MAIL_SUBJECT" "$MAIL_TO"
