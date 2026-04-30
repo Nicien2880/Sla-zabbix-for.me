@@ -1,0 +1,139 @@
+#!/bin/bash
+
+ZABBIX_URL="https://127.0.0.1/zabbix/api_jsonrpc.php"
+API_TOKEN="ВАШ_API_TOKEN"
+TRIGGER_ID="12345"
+
+CHANNEL_NAME="ISP-1"
+
+SMTP_SERVER="MAIL_SERVER"
+MAIL_FROM="zabbix@local"
+MAIL_TO="user@mail.com"
+MAIL_SUBJECT="SLA отчёт: $CHANNEL_NAME"
+
+# ===== ТЕСТ: за сегодня =====
+START=$(date -d "today 00:00:00" +%s)
+END=$(date +%s)
+PERIOD_TEXT="Тест за сегодня"
+
+# ===== Для боевого режима за прошлый месяц потом вернуть так =====
+# START=$(date -d "$(date +%Y-%m-01) -1 month" +%s)
+# END=$(date -d "$(date +%Y-%m-01) -1 second" +%s)
+# PERIOD_TEXT=$(LC_TIME=ru_RU.UTF-8 date -d "@$START" +"%B %Y")
+
+TOTAL_PERIOD=$((END - START + 1))
+
+echo "Период:"
+echo "START=$START -> $(date -d "@$START" '+%Y-%m-%d %H:%M:%S')"
+echo "END=$END -> $(date -d "@$END" '+%Y-%m-%d %H:%M:%S')"
+echo
+
+DATA=$(curl -k -s -X POST "$ZABBIX_URL" \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer $API_TOKEN" \
+-d "{
+  \"jsonrpc\":\"2.0\",
+  \"method\":\"event.get\",
+  \"params\":{
+    \"output\":[\"eventid\",\"clock\",\"value\",\"r_eventid\",\"name\"],
+    \"source\":0,
+    \"object\":0,
+    \"value\":1,
+    \"objectids\":[\"$TRIGGER_ID\"],
+    \"time_from\":$START,
+    \"time_till\":$END,
+    \"sortfield\":[\"clock\"],
+    \"sortorder\":\"ASC\"
+  },
+  \"id\":1
+}")
+
+echo "Количество PROBLEM-событий:"
+echo "$DATA" | jq '.result | length'
+echo
+
+DOWNTIME=0
+INCIDENTS=0
+
+while read -r row; do
+    EVENT_ID=$(echo "$row" | jq -r '.eventid')
+    EVENT_NAME=$(echo "$row" | jq -r '.name')
+    EVENT_START=$(echo "$row" | jq -r '.clock')
+    R_EVENTID=$(echo "$row" | jq -r '.r_eventid')
+
+    echo "Инцидент eventid=$EVENT_ID"
+    echo "Name: $EVENT_NAME"
+    echo "Start raw: $EVENT_START"
+    echo "Start: $(date -d "@$EVENT_START" '+%Y-%m-%d %H:%M:%S')"
+    echo "r_eventid: $R_EVENTID"
+
+    if [ "$R_EVENTID" != "0" ] && [ "$R_EVENTID" != "" ] && [ "$R_EVENTID" != "null" ]; then
+        RECOVERY_DATA=$(curl -k -s -X POST "$ZABBIX_URL" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $API_TOKEN" \
+        -d "{
+          \"jsonrpc\":\"2.0\",
+          \"method\":\"event.get\",
+          \"params\":{
+            \"output\":[\"eventid\",\"clock\",\"value\",\"name\"],
+            \"eventids\":[\"$R_EVENTID\"]
+          },
+          \"id\":2
+        }")
+
+        EVENT_END=$(echo "$RECOVERY_DATA" | jq -r '.result[0].clock')
+    else
+        EVENT_END=$END
+    fi
+
+    echo "End raw: $EVENT_END"
+    echo "End: $(date -d "@$EVENT_END" '+%Y-%m-%d %H:%M:%S')"
+
+    # Обрезаем событие границами периода
+    if [ "$EVENT_START" -lt "$START" ]; then
+        EVENT_START=$START
+    fi
+
+    if [ "$EVENT_END" -gt "$END" ]; then
+        EVENT_END=$END
+    fi
+
+    DURATION=$((EVENT_END - EVENT_START))
+
+    echo "Duration: $DURATION сек"
+    echo "--------------------------"
+
+    if [ "$DURATION" -gt 0 ]; then
+        DOWNTIME=$((DOWNTIME + DURATION))
+        INCIDENTS=$((INCIDENTS + 1))
+    fi
+
+done < <(echo "$DATA" | jq -c '.result[]')
+
+UPTIME=$(awk "BEGIN {printf \"%.2f\", (($TOTAL_PERIOD - $DOWNTIME) / $TOTAL_PERIOD) * 100}")
+DOWNTIME_HMS=$(printf '%02d:%02d:%02d' $((DOWNTIME/3600)) $((DOWNTIME%3600/60)) $((DOWNTIME%60)))
+
+BODY="Канал: $CHANNEL_NAME
+Период: $PERIOD_TEXT
+Downtime: $DOWNTIME сек ($DOWNTIME_HMS)
+Uptime: $UPTIME%
+Инцидентов: $INCIDENTS"
+
+echo
+echo "===== BODY ====="
+echo "$BODY"
+echo "================"
+
+{
+  printf "From: %s\r\n" "$MAIL_FROM"
+  printf "To: %s\r\n" "$MAIL_TO"
+  printf "Subject: %s\r\n" "$MAIL_SUBJECT"
+  printf "MIME-Version: 1.0\r\n"
+  printf "Content-Type: text/plain; charset=UTF-8\r\n"
+  printf "Content-Transfer-Encoding: 8bit\r\n"
+  printf "\r\n"
+  printf "%s\r\n" "$BODY"
+} | curl --url "smtp://$SMTP_SERVER:25" \
+  --mail-from "$MAIL_FROM" \
+  --mail-rcpt "$MAIL_TO" \
+  --upload-file -
